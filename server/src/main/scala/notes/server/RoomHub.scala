@@ -3,13 +3,13 @@ package notes.server
 import cats.effect.IO
 import cats.effect.kernel.Ref
 
-final class RoomHub(rooms: Ref[IO, Map[String, DocRoom]]):
+final class RoomHub(rooms: Ref[IO, Map[String, DocRoom]], store: NoteStore):
   def getOrCreate(docId: String): IO[DocRoom] =
     rooms.get.flatMap { map =>
       map.get(docId) match
         case Some(room) => IO.pure(room)
         case None =>
-          DocRoom.create(docId).flatMap { room =>
+          DocRoom.create(docId, store).flatMap { room =>
             rooms.modify { current =>
               current.get(docId) match
                 case Some(existing) => (current, existing)
@@ -19,5 +19,5 @@ final class RoomHub(rooms: Ref[IO, Map[String, DocRoom]]):
     }
 
 object RoomHub:
-  def create: IO[RoomHub] =
-    Ref.of[IO, Map[String, DocRoom]](Map.empty).map(new RoomHub(_))
+  def create(store: NoteStore): IO[RoomHub] =
+    Ref.of[IO, Map[String, DocRoom]](Map.empty).map(new RoomHub(_, store))

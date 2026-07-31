@@ -11,21 +11,25 @@ object Main extends IOApp.Simple:
   private val port: Port = port"8090"
 
   def run: IO[Unit] =
-    for
-      hub <- RoomHub.create
-      ws = new WsHandler(hub)
-      httpApp = { (wsb: org.http4s.server.websocket.WebSocketBuilder2[IO]) =>
-        val routes = new Routes(hub, ws).routes(wsb)
-        Logger.httpApp(logHeaders = true, logBody = false)(
-          CORS.policy.withAllowOriginAll(routes).orNotFound
-        )
-      }
-      _ <- IO.println(s"Notes server listening on http://$host:$port")
-      _ <- EmberServerBuilder
-        .default[IO]
-        .withHost(host)
-        .withPort(port)
-        .withHttpWebSocketApp(httpApp)
-        .build
-        .useForever
-    yield ()
+    NoteStore.open().use { store =>
+      for
+        _ <- store.migrate
+        _ <- IO.println(s"SQLite ready at ${NoteStore.DefaultPath.toAbsolutePath}")
+        hub <- RoomHub.create(store)
+        ws = new WsHandler(hub)
+        httpApp = { (wsb: org.http4s.server.websocket.WebSocketBuilder2[IO]) =>
+          val routes = new Routes(hub, ws).routes(wsb)
+          Logger.httpApp(logHeaders = true, logBody = false)(
+            CORS.policy.withAllowOriginAll(routes).orNotFound
+          )
+        }
+        _ <- IO.println(s"Notes server listening on http://$host:$port")
+        _ <- EmberServerBuilder
+          .default[IO]
+          .withHost(host)
+          .withPort(port)
+          .withHttpWebSocketApp(httpApp)
+          .build
+          .useForever
+      yield ()
+    }

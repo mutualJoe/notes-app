@@ -27,18 +27,19 @@ final case class WelcomeBundle(
 )
 
 /**
- * In-memory collaborative document room.
- * One room per docId; fans out ops / presence over WebSocket topics.
+ * Collaborative document room with SQLite-backed persistence.
+ * Presence stays in-memory; document content and version history are saved.
  */
 final class DocRoom private (
     val docId: String,
     private var title: String,
     private val document: RgaDocument,
-    private val versionCounter: AtomicLong
+    private val versionCounter: AtomicLong,
+    private val store: NoteStore,
+    private val history: mutable.ArrayBuffer[VersionRecord]
 ):
   private val lock = new Object
   private val peers = mutable.Map.empty[String, ConnectedPeer]
-  private val history = mutable.ArrayBuffer.empty[VersionRecord]
   private var opsSinceCheckpoint = 0
 
   def currentVersion: Long = versionCounter.get()
@@ -69,16 +70,25 @@ final class DocRoom private (
     }
 
   def applyOps(fromUserId: String, ops: List[Op]): IO[ServerMessage.RemoteOps] =
-    IO {
-      lock.synchronized {
-        document.applyAll(ops)
-        val v = versionCounter.incrementAndGet()
-        opsSinceCheckpoint += ops.size
-        if opsSinceCheckpoint >= 40 then
-          addCheckpoint(s"Auto-save v$v")
-          opsSinceCheckpoint = 0
-        ServerMessage.RemoteOps(fromUserId, ops, v)
+    val result =
+      IO {
+        lock.synchronized {
+          document.applyAll(ops)
+          val v = versionCounter.incrementAndGet()
+          opsSinceCheckpoint += ops.size
+          val autoCheckpoint =
+            if opsSinceCheckpoint >= 40 then
+              opsSinceCheckpoint = 0
+              addCheckpointUnsafe(s"Auto-save v$v")
+              Some(history.last)
+            else None
+          (ServerMessage.RemoteOps(fromUserId, ops, v), persistedUnsafe, autoCheckpoint)
+        }
       }
+    result.flatMap { case (remote, persisted, checkpoint) =>
+      persistDocument(persisted) *>
+        checkpoint.traverse_(persistCheckpoint) *>
+        IO.pure(remote)
     }
 
   def updateCursor(userId: String, index: Int, selectionEnd: Int): IO[ServerMessage.Presence] =
@@ -92,11 +102,15 @@ final class DocRoom private (
     }
 
   def setTitle(fromUserId: String, newTitle: String): IO[ServerMessage.TitleChanged] =
-    IO {
-      lock.synchronized {
-        title = newTitle
-        ServerMessage.TitleChanged(newTitle, fromUserId)
+    val result =
+      IO {
+        lock.synchronized {
+          title = newTitle
+          (ServerMessage.TitleChanged(newTitle, fromUserId), persistedUnsafe)
+        }
       }
+    result.flatMap { case (msg, persisted) =>
+      persistDocument(persisted).as(msg)
     }
 
   def requestHistory: IO[ServerMessage.History] =
@@ -105,31 +119,44 @@ final class DocRoom private (
     }
 
   def saveCheckpoint(label: Option[String] = None): IO[ServerMessage.CheckpointSaved] =
-    IO {
-      lock.synchronized {
-        val entry = addCheckpoint(label.getOrElse(s"Checkpoint v${currentVersion}"))
-        ServerMessage.CheckpointSaved(entry)
+    val result =
+      IO {
+        lock.synchronized {
+          val entry = addCheckpointUnsafe(label.getOrElse(s"Checkpoint v${currentVersion}"))
+          val record = history.last
+          (ServerMessage.CheckpointSaved(entry), persistedUnsafe, record)
+        }
       }
+    result.flatMap { case (msg, persisted, record) =>
+      persistDocument(persisted) *> persistCheckpoint(record).as(msg)
     }
 
   def restore(versionId: String): IO[Either[String, ServerMessage.Restored]] =
-    IO {
-      lock.synchronized {
-        history.find(_.entry.id == versionId) match
-          case None => Left(s"Unknown version: $versionId")
-          case Some(rec) =>
-            document.replaceWith(rec.atoms)
-            title = rec.title
-            val v = versionCounter.incrementAndGet()
-            addCheckpoint(s"Restored ${rec.entry.label}")
-            Right(ServerMessage.Restored(DocumentSnapshot(docId, title, document.snapshot, v)))
+    val result =
+      IO {
+        lock.synchronized {
+          history.find(_.entry.id == versionId) match
+            case None => Left("unknown")
+            case Some(rec) =>
+              document.replaceWith(rec.atoms)
+              title = rec.title
+              val v = versionCounter.incrementAndGet()
+              val checkpoint = addCheckpointUnsafe(s"Restored ${rec.entry.label}")
+              val record = history.last
+              Right(
+                (
+                  ServerMessage.Restored(DocumentSnapshot(docId, title, document.snapshot, v)),
+                  persistedUnsafe,
+                  record
+                )
+              )
+        }
       }
+    result.flatMap {
+      case Left(_) => IO.pure(Left(s"Unknown version: $versionId"))
+      case Right((restored, persisted, record)) =>
+        persistDocument(persisted) *> persistCheckpoint(record).as(Right(restored))
     }
-
-  private def snapshotUnsafe: DocumentSnapshot =
-    DocumentSnapshot(docId, title, document.snapshot, currentVersion)
-
-  private def peerListUnsafe: List[Peer] = peers.values.map(_.peer).toList
 
   def broadcast(exceptUserId: Option[String], msg: ServerMessage): IO[Unit] =
     val targets = lock.synchronized {
@@ -141,7 +168,15 @@ final class DocRoom private (
     val target = lock.synchronized(peers.get(userId))
     target.traverse_(_.outbound.publish1(msg).void)
 
-  private[server] def addCheckpoint(label: String): VersionEntry =
+  private def snapshotUnsafe: DocumentSnapshot =
+    DocumentSnapshot(docId, title, document.snapshot, currentVersion)
+
+  private def peerListUnsafe: List[Peer] = peers.values.map(_.peer).toList
+
+  private def persistedUnsafe: PersistedDocument =
+    PersistedDocument(docId, title, document.snapshot, currentVersion)
+
+  private def addCheckpointUnsafe(label: String): VersionEntry =
     val id = java.util.UUID.randomUUID().toString
     val text = document.text
     val preview = if text.length > 80 then text.take(77) + "..." else text
@@ -153,19 +188,55 @@ final class DocRoom private (
       textPreview = preview.replace('\n', ' ')
     )
     history += VersionRecord(entry, document.snapshot, title)
-    if history.size > 50 then history.remove(0)
+    while history.size > DocRoom.MaxHistory do history.remove(0)
     entry
 
+  private def persistDocument(doc: PersistedDocument): IO[Unit] =
+    store.saveDocument(doc)
+
+  private def persistCheckpoint(record: VersionRecord): IO[Unit] =
+    store.saveVersion(docId, record) *> store.trimVersions(docId, DocRoom.MaxHistory)
+
 object DocRoom:
-  def create(docId: String, initialMarkdown: String = defaultMarkdown): IO[DocRoom] =
-    IO {
-      val doc =
-        if initialMarkdown.nonEmpty then RgaDocument.fromText("system", initialMarkdown)
-        else RgaDocument.empty
-      val room = new DocRoom(docId, "Untitled note", doc, new AtomicLong(1L))
-      room.addCheckpoint("Initial version")
-      room
-    }
+  private val MaxHistory = 50
+
+  def create(docId: String, store: NoteStore, initialMarkdown: String = defaultMarkdown): IO[DocRoom] =
+    for
+      existing <- store.loadDocument(docId)
+      room <- existing match
+        case Some(doc) =>
+          store.loadVersions(docId).map { versions =>
+            val history = mutable.ArrayBuffer.from(versions)
+            new DocRoom(
+              docId = doc.docId,
+              title = doc.title,
+              document = RgaDocument.fromSnapshot(doc.atoms),
+              versionCounter = new AtomicLong(doc.version),
+              store = store,
+              history = history
+            )
+          }
+        case None =>
+          IO {
+            val document =
+              if initialMarkdown.nonEmpty then RgaDocument.fromText("system", initialMarkdown)
+              else RgaDocument.empty
+            val room = new DocRoom(
+              docId = docId,
+              title = "Untitled note",
+              document = document,
+              versionCounter = new AtomicLong(1L),
+              store = store,
+              history = mutable.ArrayBuffer.empty
+            )
+            room.addCheckpointUnsafe("Initial version")
+            room
+          }.flatMap { room =>
+            val persisted = PersistedDocument(docId, room.title, room.document.snapshot, room.currentVersion)
+            val initial = room.history.last
+            store.saveDocument(persisted) *> store.saveVersion(docId, initial).as(room)
+          }
+    yield room
 
   val defaultMarkdown: String =
     """# Welcome to Notes

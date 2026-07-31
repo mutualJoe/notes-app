@@ -33,11 +33,14 @@ lazy val server = project
       "org.http4s"    %% "http4s-dsl"          % http4sVersion,
       "org.http4s"    %% "http4s-circe"        % http4sVersion,
       "org.typelevel" %% "cats-effect"         % catsEffectVersion,
+      "org.xerial"     % "sqlite-jdbc"         % "3.49.1.0",
       "ch.qos.logback" % "logback-classic"     % "1.5.18",
       "org.scalameta" %% "munit"               % "1.1.1" % Test
     ),
     Compile / mainClass := Some("notes.server.Main"),
     Compile / run / fork := true,
+    // Persist SQLite under project data/ when forked
+    Compile / run / baseDirectory := (ThisBuild / baseDirectory).value,
     // Serve the linked Scala.js output from the client project
     Compile / resourceGenerators += Def.task {
       val outDir = (client / Compile / fastLinkJS / scalaJSLinkerOutputDirectory).value
