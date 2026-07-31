@@ -1,0 +1,15 @@
+target/
+.bsp/
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+.metals/
+.bloop/
+.vscode/
+.DS_Store
+project/project/
+project/target/
+*.log
+node_modules/
