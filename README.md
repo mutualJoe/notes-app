@@ -12,6 +12,16 @@ Cross-compiled Scala 3 app with:
 sbt "server/run"
 ```
 
+## Stop
+
+In the terminal where the server is running, press **Ctrl+C**.
+
+If it is running in the background, kill the process listening on port 8090:
+
+```bash
+kill $(lsof -t -iTCP:8090 -sTCP:LISTEN)
+```
+
 Open [http://localhost:8090/#welcome](http://localhost:8090/#welcome).  
 Open a second tab to collaborate. Use **New document** for a fresh shared note.
 
